@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>hubble.markets</title>
+    <meta charset="utf-8">
+    <style>
+        @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+        @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+        @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+        body {
+            font-family: 'Droid Serif';
+        }
+
+        h1,
+        h2,
+        h3 {
+            font-family: 'Yanone Kaffeesatz';
+            font-weight: normal;
+        }
+
+        .remark-code,
+        .remark-inline-code {
+            font-family: 'Ubuntu Mono';
+        }
+    </style>
+</head>
+
+<body>
+    <textarea id="source">
+
+class: center, middle
+
+# Maintaining global state in Solana
+Marius Ciubotariu - Hubble Protocol (8 Nov 2021)
+
+---
+
+# Agenda
+
+1. Introduction
+2. The new opportunity - design for the entire world
+3. The new constraints
+4. Potential solutions
+5. Program design & testing
+
+---
+
+# Introduction
+- Been working at Bloomberg for about 8 years
+- Building derivatives pricing systems
+- C++, OCaml 
+
+---
+
+# The new opportunity
+- Solana - a chain that can serve the entire world
+- It gives us the chance to rewrite a lot of the centralized utilities onto a decentralized infrastructure to allow for censorship resistance, without compromising on user experience.
+- Ultimately, that's what the user cares about.
+    - fast transactions
+    - low fees
+
+---
+
+# But you have constraints 
+- Compute budget is limited (1M/transaction and 200k/instruction)
+- Account model 
+    - weird to get your head around at first
+    - no hashmaps?
+    - need to declare their size upfront
+
+---
+
+# An example
+
+```rs
+fn try_liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    let sol_prices = get_price(&ctx.pyth_price_user_account)?;
+    if can_liquidate(prices, ctx.user_position) {
+        cpi::transfer(
+            ctx.user.sol_collateral_amount,     // amount
+            ctx.globalSolCollateralVault.key,   // from
+            ctx.liquidatorSolAccount.key        // to
+        );
+        cpi::transfer(
+            user.usd_debt_amount,               // amount
+            ctx.liquidatorUsdAccount.key,       // from
+            ctx.globalUsdAccount.key            // to
+        );
+
+        ctx.user.debt = 0;
+        ctx.user.collateral = 0;
+    }
+}
+```
+
+---
+
+# How do you scale this?
+
+```rs
+#[account]
+#[derive(Debug, Default)]
+pub struct Borrower {
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub borrowed_usd: u64,
+}
+```
+- A million users
+- More complex operations
+- New types of collateral, collateral ratios per token, user types 
+- If you do it badly, you will have problems scaling later on
+- Once you have deployed, it's pretty difficult to change things, you'll instead migrate
+- Migrations effort prohibit potential future developments 
+
+---
+
+## The solution lies in state design and management
+- Account size and compute budget are fixed constraints
+- But, you have a lot of freedom in designing your state:
+    - Padding & Pagination
+    - Splitting (state machine) & Offchain processes
+
+---
+
+## Potential solution 1 - Padding and pagination
+```rs
+#[zero_copy]
+#[derive(Debug, Default)]
+pub struct Borrower {
+    pub page_id: u64,
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub borrowed_usd: u64,
+}
+
+#[zero_copy]
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserPositions {
+    pub page_id: u64,
+    pub users: [Borrower; 2000],
+}
+```
+---
+
+## Potential solution 1 - Padding and pagination
+```rs
+#[zero_copy]
+#[derive(Debug, Default)]
+pub struct Borrower {
+    pub page_id: u64,
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub borrowed_usd: u64,
+    padding: [u8; 1000]
+}
+
+#[zero_copy]
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserPositions {
+    pub page_id: u64,
+    pub users: [Borrower; 2000],
+}
+```
+---
+
+## Potential solution 1 - Padding and pagination
+```rs
+#[zero_copy]
+#[derive(Debug, Default)]
+pub struct Borrower {
+    pub page_id: u64,
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub borrowed_usd: u64,
+    pub deposited_srm: u64,
+    padding: [u8; 992]
+}
+
+#[zero_copy]
+#[derive(Debug, PartialEq, Eq)]
+pub struct UserPositions {
+    pub page_id: u64,
+    pub users: [Borrower; 2000],
+}
+```
+
+Problems with this:
+    - you pay for memory upfront, storing Pubkeys
+    - you can't *really* scale
+    - RUST_STACK_MEMORY
+
+---
+## Potential solution 2 - Per user account and PDA 
+```rs
+#[account]
+#[derive(Debug, Default)]
+pub struct Borrower {
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub borrowed_usd: u64,
+    padding: [u8; 1000]
+}
+
+fn liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    let mut user: &mut Borrower = &mut ctx.accounts.borrower;
+    do_stuff(&mut user);
+}
+```
+---
+## Potential solution 2 - Per user account and PDA 
+```rs
+#[account]
+#[derive(Debug, Default)]
+pub struct BorrowerV2 {
+    pub user: Pubkey,
+    pub deposited_sol: u64,
+    pub deposited_eth: u64,
+    pub deposited_btc: u64,
+    pub deposited_srm: u64,
+    pub borrowed_usd: u64,
+
+}
+
+fn liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    let mut user: &mut BorrowerV2 = &mut ctx.accounts.borrower;
+    do_stuff(&mut user);
+}
+```
+---
+## Potential solution 3 - State machine
+Split your instructions into multiple types.
+```rs
+fn liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    let prices = get_prices(ctx);
+    if can_liquidate(prices, ctx.user_position) {
+        user_posiion.status = MarkedForLiquidation;
+    }
+}
+```
+
+```rs
+fn process_liquidation(ctx: Context<Accounts>, token: Token) -> ProgramResult {
+    let prices = get_prices(ctx);
+    if user.status == MarkedForLiquidation {
+        cpi::transfer(
+            sol: user.collateral,
+            from: collateralVault,
+            to: liquidatorAccount
+        );
+    }
+        
+    user.collateral[token] = 0;
+}
+```
+---
+## Potential solution 3 - State machine
+Split your instructions into multiple types.
+```rs
+fn add_liquidation_order(ctx: Context<Accounts>) -> ProgramResult { }
+fn fill_liquidation_order(ctx: Context<Accounts>) -> ProgramResult { }
+fn clear_liquidation_order(ctx: Context<Accounts>) -> ProgramResult { }
+```
+- Off chain you can do anything you want
+- Mirror your on-chain state off-chain
+- You need to incentivise bots to run these transactions (% of liq gains)
+
+---
+## The engineering tradeoff is increased complexity 
+- As you add scale and complexity, testing becomes absolutely essential
+- (you should always do that)
+- How does your program behave after 1 million users/events
+- Typically people write integration tests (local validator + TS tests)
+- How fast is that feedback loop
+
+---
+## Another look at program design
+```rs
+fn try_liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    let prices = get_prices(ctx);
+    if can_liquidate(prices, ctx.user_position) {
+        cpi::transfer(
+            ctx.user.sol_collateral_amount,     // amount
+            ctx.globalSolCollateralVault.key,   // from
+            ctx.liquidatorSolAccount.key        // to
+        );
+        cpi::transfer(
+            user.usd_debt_amount,               // amount
+            ctx.liquidatorUsdAccount.key,       // from
+            ctx.globalUsdAccount.key            // to
+        );
+
+        ctx.user.debt = 0;
+        ctx.user.collateral = 0;
+    }
+}
+```
+---
+
+## Another look at program design
+```rs
+fn try_liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    // state update
+    // token transfers (and maybe cpi calls)
+}
+```
+---
+## Another look at program design
+```rs
+fn try_liquidate(ctx: Context<Accounts>) -> ProgramResult {
+    
+    // state update
+    let LiquidateEffects {
+        usd_to_transfer,
+        sol_to_transfer
+    } = liquidations::try_liquidate(
+        &mut ctx.user,
+        &mut ctx.market 
+    );
+
+    // "side" effects
+    cpi::transfer(
+        usd_to_transfer,                    // amount
+        ctx.liquidatorUsdAccount.key,       // from
+        ctx.globalUsdAccount.key            // to
+    );
+
+}
+
+```
+---
+
+## This approach provides an alternative to integration tests
+
+- A lot of overhead: Account creation, rpc calls
+- You start thinking:
+    - What should be the new state after this transaction
+    - What should be the new balances after this transaction
+    - What do I actually want to test?
+- What you shouldn't have as part of your feedback loop:
+    - cpi calls and tests every single time (solana works)
+    - rpc calls
+
+---
+
+## Rust testing - front and center 
+
+```rs
+#[test]
+fn test_liquidation_millions_of_users() {
+    let mut market = Market::new();
+    let mut borrowers = utils::create_new_users(
+        1_000_000,      // count 
+        100,            // debt
+        50);            // collateral
+
+    let LiquidateEffects {
+        usd_to_transfer,
+        sol_to_transfer
+    } =  (0..count).fold(
+        LiquidateEffects::default(),                    // accumulator
+        |acc, i| acc.add(liquidations::try_liquidate(   // this effects
+            &mut borrowers[i],
+            &mut market)
+    );
+    
+    asset_eq!(market.borrowed_amount, ...);
+    asset_eq!(market.deposited_sol, ...);
+    asset_eq!(usd_to_transfer, ...);
+    asset_eq!(sol_to_transfer, ...);
+
+}
+```
+
+This runs in the blink of an eye.
+
+---
+
+## What this unlocks 
+- If your program is complex and involve intermediary state machines you can write a #[cfg(test)]  "greedy" algorithm that does everything in very few lines of code and test against the chain imeplementation and assert the effects are the same.
+- Locking behaviour
+
+
+    </textarea>
+    <script src="https://remarkjs.com/downloads/remark-latest.min.js">
+    </script>
+    <script>
+        var slideshow = remark.create();
+    </script>
+</body>
+
+</html>
